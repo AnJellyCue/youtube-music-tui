@@ -2,6 +2,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Header, Footer, ListItem, ListView, Static
 from ytmusicapi import YTMusic
+from cache_db import MusicCache
 import psutil
 import time
 import subprocess
@@ -103,6 +104,7 @@ class YouTubeMusicTUI(App):
         super().__init__()
 
         self.yt = YTMusic("auth.json")
+        self.cache = MusicCache()
         self.playlists = []
         self.current_tracks = []
         self.track_map = {}
@@ -289,10 +291,19 @@ class YouTubeMusicTUI(App):
     def refresh_library(self):
         content = self.query_one("#content_text", Static)
 
-        try:
-            self.playlists = self.yt.get_library_playlists(
-                limit=100
+        cached = self.cache.get_collection("playlists")
+        if cached is not None:
+            self.playlists = cached
+            content.update(
+                "♫  YOUR PLAYLISTS (cached)\n\n"
+                f"{len(self.playlists)} playlists available.\n\n"
+                "Refreshing from YouTube Music…"
             )
+
+        try:
+            fresh = self.yt.get_library_playlists(limit=100)
+            self.playlists = fresh
+            self.cache.save_collection("playlists", fresh)
 
             content.update(
                 "♫  YOUR PLAYLISTS\n\n"
@@ -301,12 +312,24 @@ class YouTubeMusicTUI(App):
             )
 
         except Exception as e:
-            content.update(
-                f"Unable to load library:\n\n{e}"
-            )
+            if cached is not None:
+                content.update(
+                    "♫  YOUR PLAYLISTS (offline cache)\n\n"
+                    f"{len(self.playlists)} cached playlists available.\n\n"
+                    f"Refresh failed: {e}"
+                )
+            else:
+                content.update(
+                    f"Unable to load library:\n\n{e}"
+                )
 
     def on_list_view_selected(self, event: ListView.Selected):
-        item_id = event.item.id
+        self.call_after_refresh(
+            self._handle_selected_item,
+            event.item.id,
+        )
+
+    def _handle_selected_item(self, item_id):
 
         if item_id == "liked":
             self.show_liked()
@@ -545,6 +568,11 @@ class YouTubeMusicTUI(App):
             f"{artists}\n\n"
             "▶ Playing"
         )
+        self.query_one("#now-playing", Static).update(
+            f"♫  NOW PLAYING\n\n"
+            f"{title}\n"
+            f"{artists}"
+        )
 
     def _show_playback_error(self, error):
         self.query_one("#content_text", Static).update(
@@ -605,7 +633,7 @@ class YouTubeMusicTUI(App):
                 items.append(
                     ListItem(
                         Static(f"{title} — {artist_names}"),
-                        id=f"album-{index}",
+                        id=f"album-{time.time_ns()}-{index}",
                     )
                 )
 
