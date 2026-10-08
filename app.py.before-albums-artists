@@ -1,0 +1,841 @@
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Header, Footer, ListItem, ListView, Static
+from ytmusicapi import YTMusic
+import psutil
+import time
+import subprocess
+import sys
+import socket
+import threading
+import os
+
+
+class YouTubeMusicTUI(App):
+    TITLE = "YouTube Music"
+    SUB_TITLE = "Library"
+
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+
+    #main {
+        height: 1fr;
+    }
+
+    #sidebar {
+        width: 42;
+        border: solid $accent;
+    }
+
+    #content {
+        width: 1fr;
+        border: solid $accent;
+        padding: 1 2;
+    }
+
+    #title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #network {
+        height: 7;
+        border: solid $accent;
+        padding: 0 2;
+    }
+
+    ListView {
+        height: 1fr;
+    }
+    """
+
+    BINDINGS = [
+        ("p", "play_pause", "Play/Pause"),
+        ("space", "play_pause", "Play/Pause"),
+        ("s", "stop_playback", "Stop"),
+        ("n", "next_track", "Next"),
+        ("b", "previous_track", "Previous"),
+        ("+", "volume_up", "Vol +"),
+        ("-", "volume_down", "Vol -"),
+        ("q", "quit", "Quit"),
+        ("r", "refresh", "Refresh"),
+        ("escape", "back", "Back"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+
+        self.yt = YTMusic("auth.json")
+        self.playlists = []
+        self.current_tracks = []
+        self.track_map = {}
+        self.track_counter = 0
+
+        self.albums = {}
+        self.artists = {}
+        self.ytdlp_process = None
+        self.mpv_process = None
+        self.current_track = None
+        self.mpv_process = None
+        self.mpv_socket = "/tmp/youtube-music-tui-mpv.sock"
+        self.play_request_id = 0
+
+        # Network monitoring
+        self.last_net = None
+        self.last_net_time = time.monotonic()
+
+        self.session_downloaded = 0
+        self.session_uploaded = 0
+
+        self.net_interface = self.get_default_interface()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+
+        with Horizontal(id="main"):
+            with Vertical(id="sidebar"):
+                yield Static("♫  LIBRARY", id="title")
+
+                yield ListView(
+                    ListItem(Static("♥  Liked Music"), id="liked"),
+                    ListItem(Static("♫  Playlists"), id="playlists"),
+                    ListItem(Static("💿  Albums"), id="albums"),
+                    ListItem(Static("👤  Artists"), id="artists"),
+                    id="library",
+                )
+
+            with Vertical(id="content"):
+                yield Static(
+                    "Loading YouTube Music…",
+                    id="content_text"
+                )
+
+                yield ListView(id="tracks")
+
+                yield Static(
+                    "🌐 NETWORK\n"
+                    "↓ Download     --\n"
+                    "↑ Upload       --\n"
+                    "↓ Session      0 B\n"
+                    "↑ Session      0 B\n"
+                    "Interface      --",
+                    id="network",
+                )
+
+        yield Footer()
+
+    def on_mount(self):
+        self.query_one("#tracks").display = False
+
+        self.refresh_library()
+
+        self.update_network()
+        self.set_interval(1, self.update_network)
+
+    # ---------------------------------------------------------
+    # Network
+    # ---------------------------------------------------------
+
+    def get_default_interface(self):
+        try:
+            with open("/proc/net/route", "r") as f:
+                for line in f.readlines()[1:]:
+                    fields = line.split()
+
+                    if len(fields) >= 2 and fields[1] == "00000000":
+                        return fields[0]
+
+        except Exception:
+            pass
+
+        return None
+
+    def update_network(self):
+        network = self.query_one("#network", Static)
+
+        try:
+            counters = psutil.net_io_counters(pernic=True)
+            interface = self.net_interface
+
+            if interface not in counters:
+                network.update(
+                    "🌐 NETWORK\n"
+                    "↓ Download     --\n"
+                    "↑ Upload       --\n"
+                    "↓ Session      0 B\n"
+                    "↑ Session      0 B\n"
+                    "Interface      --"
+                )
+                return
+
+            current = counters[interface]
+            now = time.monotonic()
+
+            if self.last_net is None:
+                self.last_net = current
+                self.last_net_time = now
+
+                network.update(
+                    "🌐 NETWORK\n"
+                    "↓ Download     --\n"
+                    "↑ Upload       --\n"
+                    "↓ Session      0 B\n"
+                    "↑ Session      0 B\n"
+                    f"Interface      {interface}"
+                )
+
+                return
+
+            elapsed = now - self.last_net_time
+
+            if elapsed <= 0:
+                return
+
+            downloaded = (
+                current.bytes_recv -
+                self.last_net.bytes_recv
+            )
+
+            uploaded = (
+                current.bytes_sent -
+                self.last_net.bytes_sent
+            )
+
+            download_rate = downloaded / elapsed
+            upload_rate = uploaded / elapsed
+
+            self.session_downloaded += max(0, downloaded)
+            self.session_uploaded += max(0, uploaded)
+
+            network.update(
+                "🌐 NETWORK\n"
+                f"↓ Download     {self.format_bytes(download_rate)}/s\n"
+                f"↑ Upload       {self.format_bytes(upload_rate)}/s\n"
+                f"↓ Session      {self.format_bytes(self.session_downloaded)}\n"
+                f"↑ Session      {self.format_bytes(self.session_uploaded)}\n"
+                f"Interface      {interface}"
+            )
+
+            self.last_net = current
+            self.last_net_time = now
+
+        except Exception as e:
+            network.update(
+                "🌐 NETWORK\n"
+                f"Unable to read network statistics:\n{e}"
+            )
+
+    @staticmethod
+    def format_bytes(value):
+        value = float(value)
+
+        units = ["B", "KB", "MB", "GB", "TB"]
+
+        for unit in units:
+            if value < 1024:
+                return f"{value:.1f} {unit}"
+
+            value /= 1024
+
+        return f"{value:.1f} PB"
+
+    # ---------------------------------------------------------
+    # Library
+    # ---------------------------------------------------------
+
+    def refresh_library(self):
+        content = self.query_one("#content_text", Static)
+
+        try:
+            self.playlists = self.yt.get_library_playlists(
+                limit=100
+            )
+
+            # Rebuild album and artist indexes
+            self.albums.clear()
+            self.artists.clear()
+
+            for playlist in self.playlists:
+                playlist_id = playlist.get("playlistId")
+
+                if not playlist_id:
+                    continue
+
+                try:
+                    data = self.yt.get_playlist(
+                        playlist_id,
+                        limit=5000
+                    )
+
+                    playlist_tracks = data.get("tracks", [])
+
+                    self.index_tracks(playlist_tracks)
+
+                except Exception:
+                    # One inaccessible playlist should not stop
+                    # the rest of the library from loading.
+                    continue
+
+            content.update(
+                "♫  YOUR PLAYLISTS\n\n"
+                f"{len(self.playlists)} playlists loaded.\n"
+                f"{len(self.albums)} albums indexed.\n"
+                f"{len(self.artists)} artists indexed.\n\n"
+                "Click Playlists, Albums or Artists to browse."
+            )
+
+        except Exception as e:
+            content.update(
+                f"Unable to load library:\n\n{e}"
+            )
+
+    def on_list_view_selected(self, event: ListView.Selected):
+        item_id = event.item.id
+
+        if item_id == "liked":
+            self.show_liked()
+
+        elif item_id == "playlists":
+            self.show_playlists()
+
+        elif item_id == "albums":
+            self.show_albums()
+
+        elif item_id == "artists":
+            self.show_artists()
+
+        elif item_id and item_id.startswith("playlist-"):
+            index = int(item_id.split("-")[1])
+            self.show_playlist(index)
+
+        elif item_id and item_id.startswith("album-"):
+            albums = sorted(self.albums.keys(), key=str.casefold)
+            index = int(item_id.split("-")[1])
+            self.show_media_tracks(
+                albums[index],
+                self.albums[albums[index]],
+                "💿"
+            )
+
+        elif item_id and item_id.startswith("artist-"):
+            artists = sorted(self.artists.keys(), key=str.casefold)
+            index = int(item_id.split("-")[1])
+            self.show_media_tracks(
+                artists[index],
+                self.artists[artists[index]],
+                "👤"
+            )
+
+        elif item_id and item_id.startswith("track-"):
+            track = self.track_map.get(item_id)
+            if track:
+                self.play_track(track)
+
+    def play_track(self, track):
+        video_id = track.get("videoId")
+
+        if not video_id:
+            self.query_one("#content_text", Static).update(
+                "Unable to play track: no video ID."
+            )
+            return
+
+        self.play_request_id += 1
+        request_id = self.play_request_id
+
+        title = track.get("title", "Unknown")
+        artists = ", ".join(
+            a.get("name", "Unknown")
+            for a in track.get("artists", [])
+        )
+
+        self.query_one("#content_text", Static).update(
+            f"♫  NOW PLAYING\n\n"
+            f"{title}\n"
+            f"{artists}\n\n"
+            "Resolving audio…"
+        )
+
+        threading.Thread(
+            target=self._resolve_and_play,
+            args=(track, request_id),
+            daemon=True,
+        ).start()
+
+    def _resolve_and_play(self, track, request_id):
+        video_id = track.get("videoId")
+        url = f"https://www.youtube.com/watch?v={video_id}"
+
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "yt_dlp",
+                    "-f",
+                    "140",
+                    "--get-url",
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    result.stderr.strip() or "yt-dlp failed"
+                )
+
+            urls = [
+                line.strip()
+                for line in result.stdout.splitlines()
+                if line.strip()
+            ]
+
+            if not urls:
+                raise RuntimeError("yt-dlp returned no audio URL")
+
+            audio_url = urls[0]
+
+            if request_id != self.play_request_id:
+                return
+
+            self._ensure_mpv()
+            self._send_mpv_command(
+                ["loadfile", audio_url, "replace"]
+            )
+
+            self.current_track = track
+
+            self.call_from_thread(
+                self._show_playing,
+                title=track.get("title", "Unknown"),
+                artists=", ".join(
+                    a.get("name", "Unknown")
+                    for a in track.get("artists", [])
+                ),
+            )
+
+        except Exception as e:
+            if request_id == self.play_request_id:
+                self.call_from_thread(
+                    self._show_playback_error,
+                    str(e),
+                )
+
+    def _ensure_mpv(self):
+        if (
+            self.mpv_process
+            and self.mpv_process.poll() is None
+            and os.path.exists(self.mpv_socket)
+        ):
+            return
+
+        try:
+            os.unlink(self.mpv_socket)
+        except FileNotFoundError:
+            pass
+
+        self.mpv_process = subprocess.Popen(
+            [
+                "mpv",
+                "--no-video",
+                "--idle=yes",
+                "--really-quiet",
+                f"--input-ipc-server={self.mpv_socket}",
+                "--audio-client-name=YouTube Music TUI",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        for _ in range(50):
+            if os.path.exists(self.mpv_socket):
+                return
+            time.sleep(0.1)
+
+        raise RuntimeError(
+            "mpv IPC socket did not become available"
+        )
+
+    def _send_mpv_command(self, command):
+        import json
+
+        message = json.dumps(
+            {"command": command}
+        ) + "\n"
+
+        with socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM,
+        ) as sock:
+            sock.settimeout(5)
+            sock.connect(self.mpv_socket)
+            sock.sendall(message.encode())
+
+    def _show_playing(self, title, artists):
+        self.query_one("#content_text", Static).update(
+            f"♫  NOW PLAYING\n\n"
+            f"{title}\n"
+            f"{artists}\n\n"
+            "▶ Playing"
+        )
+
+    def _show_playback_error(self, error):
+        self.query_one("#content_text", Static).update(
+            f"Unable to play track:\n\n{error}"
+        )
+
+    def index_tracks(self, tracks):
+        for track in tracks:
+            if not track:
+                continue
+
+            album = track.get("album")
+            if album:
+                album_name = album.get("name") if isinstance(album, dict) else str(album)
+
+                if album_name:
+                    self.albums.setdefault(
+                        album_name,
+                        []
+                    ).append(track)
+
+            for artist in track.get("artists", []):
+                artist_name = artist.get("name")
+
+                if artist_name:
+                    self.artists.setdefault(
+                        artist_name,
+                        []
+                    ).append(track)
+
+    def show_albums(self):
+        content = self.query_one("#content_text", Static)
+        tracks = self.query_one("#tracks")
+
+        tracks.clear()
+        tracks.display = False
+        content.display = True
+
+        albums = sorted(
+            self.albums.keys(),
+            key=str.casefold
+        )
+
+        content.update(
+            "💿  ALBUMS\n\n"
+            f"{len(albums)} albums loaded.\n\n"
+            "Select an album."
+        )
+
+
+    def show_artists(self):
+        content = self.query_one("#content_text", Static)
+        tracks = self.query_one("#tracks")
+
+        tracks.clear()
+        tracks.display = False
+        content.display = True
+
+        artists = sorted(
+            self.artists.keys(),
+            key=str.casefold
+        )
+
+        content.update(
+            "👤  ARTISTS\n\n"
+            f"{len(artists)} artists loaded.\n\n"
+            "Select an artist."
+        )
+
+
+    def show_media_tracks(self, name, media_tracks, icon):
+        content = self.query_one("#content_text", Static)
+        tracks = self.query_one("#tracks")
+
+        content.display = True
+        tracks.display = True
+        tracks.clear()
+
+        self.current_tracks = list(media_tracks)
+
+        content.update(
+            f"{icon}  {name}\n\n"
+            f"{len(self.current_tracks)} tracks"
+        )
+
+        for track in self.current_tracks:
+            title = track.get("title", "Unknown")
+
+            artists = ", ".join(
+                a.get("name", "Unknown")
+                for a in track.get("artists", [])
+            )
+
+            track_id = f"track-{self.track_counter}"
+            self.track_counter += 1
+            self.track_map[track_id] = track
+
+            tracks.append(
+                ListItem(
+                    Static(
+                        f"{title} — {artists}"
+                    ),
+                    id=track_id,
+                )
+            )
+
+    def show_playlists(self):
+        content = self.query_one("#content_text", Static)
+        tracks = self.query_one("#tracks")
+
+        tracks.clear()
+        tracks.display = False
+        content.display = True
+
+        playlist_list = self.query_one("#library")
+        playlist_list.clear()
+
+        for index, playlist in enumerate(self.playlists):
+            title = playlist.get("title", "Untitled")
+            count = playlist.get("count", "?")
+
+            playlist_list.append(
+                ListItem(
+                    Static(f"{title}  [{count}]"),
+                    id=f"playlist-{index}",
+                )
+            )
+
+        content.update(
+            "♫  YOUR PLAYLISTS\n\n"
+            "Select a playlist."
+        )
+
+    def show_playlist(self, index):
+        playlist = self.playlists[index]
+        playlist_id = playlist["playlistId"]
+        title = playlist.get("title", "Untitled")
+
+        content = self.query_one("#content_text", Static)
+        tracks = self.query_one("#tracks")
+
+        content.display = True
+        tracks.display = True
+        tracks.clear()
+
+        content.update(
+            f"♫  {title}\n\n"
+            "Loading tracks…"
+        )
+
+        try:
+            data = self.yt.get_playlist(
+                playlist_id,
+                limit=5000
+            )
+
+            content.update(
+                f"♫  {title}\n\n"
+                f"{len(data.get('tracks', []))} tracks"
+            )
+
+            self.index_tracks(data.get("tracks", []))
+            self.current_tracks = []
+
+            for track in data.get("tracks", []):
+                if not track:
+                    continue
+
+                self.current_tracks.append(track)
+
+                track_id = f"track-{self.track_counter}"
+                self.track_counter += 1
+                self.track_map[track_id] = track
+
+                track_title = track.get(
+                    "title",
+                    "Unknown"
+                )
+
+                artists = ", ".join(
+                    a.get("name", "Unknown")
+                    for a in track.get("artists", [])
+                )
+
+                tracks.append(
+                    ListItem(
+                        Static(
+                            f"{track_title} — {artists}"
+                        ),
+                        id=track_id,
+                    )
+                )
+
+        except Exception as e:
+            content.update(
+                f"♫  {title}\n\n"
+                f"Unable to load playlist:\n\n{e}"
+            )
+
+    def show_liked(self):
+        content = self.query_one(
+            "#content_text",
+            Static
+        )
+
+        tracks = self.query_one("#tracks")
+
+        content.display = True
+        tracks.display = True
+        tracks.clear()
+
+        try:
+            liked = self.yt.get_liked_songs(
+                limit=5000
+            )
+
+            content.update(
+                "♥  LIKED MUSIC\n\n"
+                f"Total reported: "
+                f"{liked.get('trackCount', '?')}"
+            )
+
+            for item in liked.get("tracks", []):
+                track = item.get("track")
+
+                if not track:
+                    continue
+
+                title = track.get(
+                    "title",
+                    "Unknown"
+                )
+
+                artists = ", ".join(
+                    a.get("name", "Unknown")
+                    for a in track.get("artists", [])
+                )
+
+                tracks.append(
+                    ListItem(
+                        Static(
+                            f"{title} — {artists}"
+                        )
+                    )
+                )
+
+        except Exception as e:
+            content.update(
+                "♥  LIKED MUSIC\n\n"
+                f"Unable to load liked music:\n\n{e}"
+            )
+
+    def _safe_mpv_command(self, command):
+        try:
+            self._send_mpv_command(command)
+            return True
+        except Exception:
+            return False
+
+    def action_play_pause(self):
+        if self._safe_mpv_command(
+            ["cycle", "pause"]
+        ):
+            self.query_one("#content_text", Static).update(
+                "♫  PLAYBACK\n\n"
+                "▶ / ⏸  Play / Pause"
+            )
+
+    def action_stop_playback(self):
+        if self._safe_mpv_command(
+            ["stop"]
+        ):
+            self.query_one("#content_text", Static).update(
+                "♫  PLAYBACK\n\n"
+                "⏹ Stopped"
+            )
+
+    def action_next_track(self):
+        if not self.current_tracks:
+            return
+
+        try:
+            current_index = self.current_tracks.index(
+                self.current_track
+            )
+        except ValueError:
+            current_index = -1
+
+        next_index = current_index + 1
+
+        if next_index >= len(self.current_tracks):
+            next_index = 0
+
+        self.play_track(
+            self.current_tracks[next_index]
+        )
+
+    def action_previous_track(self):
+        if not self.current_tracks:
+            return
+
+        try:
+            current_index = self.current_tracks.index(
+                self.current_track
+            )
+        except ValueError:
+            current_index = 0
+
+        previous_index = current_index - 1
+
+        if previous_index < 0:
+            previous_index = len(self.current_tracks) - 1
+
+        self.play_track(
+            self.current_tracks[previous_index]
+        )
+
+    def action_volume_up(self):
+        self._safe_mpv_command(
+            ["add", "volume", 5]
+        )
+
+    def action_volume_down(self):
+        self._safe_mpv_command(
+            ["add", "volume", -5]
+        )
+
+    def action_refresh(self):
+        self.refresh_library()
+
+    def action_back(self):
+        self.show_playlists()
+
+
+    def on_unmount(self):
+        self.play_request_id += 1
+
+        if (
+            self.mpv_process
+            and self.mpv_process.poll() is None
+        ):
+            self.mpv_process.terminate()
+
+            try:
+                self.mpv_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.mpv_process.kill()
+
+        try:
+            os.unlink(self.mpv_socket)
+        except FileNotFoundError:
+            pass
+
+if __name__ == "__main__":
+    YouTubeMusicTUI().run()
